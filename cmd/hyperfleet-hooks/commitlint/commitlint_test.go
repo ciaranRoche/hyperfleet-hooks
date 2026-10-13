@@ -568,6 +568,32 @@ func newRepoWithCommit(t *testing.T, message, authorName, authorEmail string) (*
 	return repo, hash.String()
 }
 
+// addCommit commits one more file to repo with the given message and returns the commit hash
+func addCommit(t *testing.T, repo *git.Repository, message, filename string) string {
+	t.Helper()
+	worktree, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filename, []byte(filename), 0644))
+	_, err = worktree.Add(filename)
+	require.NoError(t, err)
+
+	hash, err := worktree.Commit(message, &git.CommitOptions{
+		Author: &object.Signature{Name: "developer", Email: "developer@redhat.com"},
+	})
+	require.NoError(t, err)
+	return hash.String()
+}
+
+// newRepoWithBadCommit creates a repo whose head is a commit that fails the commit rules,
+// on top of a valid base commit, and returns the base and head hashes so a PULL_REFS
+// range of base..head contains exactly the bad commit
+func newRepoWithBadCommit(t *testing.T) (baseHash, badHash string) {
+	t.Helper()
+	repo, baseHash := newRepoWithCommit(t, "feat: base commit", "developer", "developer@redhat.com")
+	badHash = addCommit(t, repo, "this does not conform to the standard", "bad.txt")
+	return baseHash, badHash
+}
+
 func TestGetPRTitle(t *testing.T) {
 	tests := []struct {
 		env        map[string]string
@@ -659,9 +685,9 @@ func TestGetPRTitle(t *testing.T) {
 func TestValidatePR_TitleOnlyIgnoresCommitMessages(t *testing.T) {
 	clearPREnv(t)
 
-	// A commit that fails the commit rules outright
-	_, badHash := newRepoWithCommit(t, "this does not conform to the standard", "developer", "developer@redhat.com")
-	t.Setenv("PULL_REFS", "main:"+badHash+",42:"+badHash)
+	// The range contains exactly one commit, and it fails the commit rules outright
+	baseHash, badHash := newRepoWithBadCommit(t)
+	t.Setenv("PULL_REFS", "main:"+baseHash+",42:"+badHash)
 	t.Setenv("JOB_SPEC", jobSpecJSON("HYPERFLEET-42 - feat: add thing", "developer"))
 
 	validator := pkgcommitlint.NewValidator()
@@ -673,24 +699,14 @@ func TestValidatePR_TitleOnlyIgnoresCommitMessages(t *testing.T) {
 func TestValidatePR_WithCommitsValidatesCommitMessages(t *testing.T) {
 	clearPREnv(t)
 
-	// Base is the parent of head so the range contains exactly the bad commit
-	repo, baseHash := newRepoWithCommit(t, "feat: base commit", "developer", "developer@redhat.com")
-	worktree, err := repo.Worktree()
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile("bad.txt", []byte("bad"), 0644))
-	_, err = worktree.Add("bad.txt")
-	require.NoError(t, err)
-	badHash, err := worktree.Commit("this does not conform to the standard", &git.CommitOptions{
-		Author: &object.Signature{Name: "developer", Email: "developer@redhat.com"},
-	})
-	require.NoError(t, err)
-
-	t.Setenv("PULL_REFS", "main:"+baseHash+",42:"+badHash.String())
+	// Same range as the title-only test, so the two differ only in the flag
+	baseHash, badHash := newRepoWithBadCommit(t)
+	t.Setenv("PULL_REFS", "main:"+baseHash+",42:"+badHash)
 	t.Setenv("JOB_SPEC", jobSpecJSON("HYPERFLEET-42 - feat: add thing", "developer"))
 
 	validator := pkgcommitlint.NewValidator()
 
-	err = validatePR(context.Background(), validator, true)
+	err := validatePR(context.Background(), validator, true)
 	require.ErrorIs(t, err, errValidationFailed, "--commits must still fail on a bad commit message")
 }
 
